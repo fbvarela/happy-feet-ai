@@ -1178,6 +1178,271 @@ function setupIpcHandlers() {
     }
   });
 
+  // ─── Backup ───────────────────────────────────────────────────────────────
+
+  ipcMain.handle('backup:getSettings', async () => {
+    try {
+      const db = getDb();
+      return {
+        success: true,
+        settings: {
+          enabled:       getSetting(db, 'backup_enabled') === '1',
+          folder:        getSetting(db, 'backup_folder') || '',
+          intervalHours: parseInt(getSetting(db, 'backup_interval_hours') || '24'),
+          retention:     parseInt(getSetting(db, 'backup_retention') || '10'),
+          lastBackup:    getSetting(db, 'backup_last_run') || null,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('backup:saveSettings', async (event, settings) => {
+    try {
+      const db = getDb();
+      const { getDbPath } = require('./database');
+      const { scheduleBackup, stopBackupSchedule } = require('./backup');
+
+      setSetting(db, 'backup_enabled',        settings.enabled ? '1' : '0');
+      setSetting(db, 'backup_folder',         settings.folder || '');
+      setSetting(db, 'backup_interval_hours', String(settings.intervalHours || 24));
+      setSetting(db, 'backup_retention',      String(settings.retention || 10));
+
+      if (settings.enabled && settings.folder) {
+        scheduleBackup(getDbPath(), settings.intervalHours, settings.folder, settings.retention);
+      } else {
+        stopBackupSchedule();
+      }
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('backup:runNow', async () => {
+    try {
+      const db = getDb();
+      const { getDbPath } = require('./database');
+      const { performBackup, pruneOldBackups } = require('./backup');
+
+      const folder = getSetting(db, 'backup_folder');
+      if (!folder) return { success: false, error: 'No hay carpeta de destino configurada' };
+
+      const backupPath = performBackup(getDbPath(), folder);
+      const retention = parseInt(getSetting(db, 'backup_retention') || '10');
+      pruneOldBackups(folder, retention);
+
+      const now = new Date().toISOString();
+      setSetting(db, 'backup_last_run', now);
+      return { success: true, backupPath };
+    } catch (error) {
+      log.error('Manual backup failed:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('backup:getList', async () => {
+    try {
+      const db = getDb();
+      const { getBackupList } = require('./backup');
+      const folder = getSetting(db, 'backup_folder');
+      return { success: true, list: getBackupList(folder) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('backup:chooseFolder', async () => {
+    try {
+      const { dialog } = require('electron');
+      const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+      if (result.canceled || !result.filePaths.length) return { success: false };
+      return { success: true, folder: result.filePaths[0] };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('backup:openFolder', async () => {
+    try {
+      const db = getDb();
+      const { shell } = require('electron');
+      const folder = getSetting(db, 'backup_folder');
+      if (folder) await shell.openPath(folder);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  // ─── Dashboard ───────────────────────────────────────────────────────────
+
+  ipcMain.handle('dashboard:getSummary', async () => {
+    try {
+      const db = getDb();
+      const now = new Date();
+      const y   = now.getFullYear();
+      const m   = String(now.getMonth() + 1).padStart(2, '0');
+      const monthStart = `${y}-${m}-01`;
+      const monthEnd   = `${y}-${m}-31`;
+
+      const totalPatients = db.prepare(
+        'SELECT COUNT(*) as n FROM clients WHERE activo = 1'
+      ).get().n;
+
+      const monthRevenue = db.prepare(`
+        SELECT COALESCE(SUM(total), 0) as total
+        FROM invoices
+        WHERE fecha BETWEEN ? AND ? AND estado != 'Anulada'
+      `).get(monthStart, monthEnd).total;
+
+      const pendingInvoices = db.prepare(
+        "SELECT COUNT(*) as n FROM invoices WHERE estado = 'Emitida'"
+      ).get().n;
+
+      const monthVisits = db.prepare(`
+        SELECT COUNT(*) as n FROM clinic_history
+        WHERE fecha BETWEEN ? AND ?
+      `).get(monthStart, monthEnd).n;
+
+      const recentInvoices = db.prepare(`
+        SELECT i.id, i.numero_factura, i.total, i.estado,
+               c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos
+        FROM invoices i
+        JOIN clients c ON i.cliente_id = c.id
+        ORDER BY i.fecha DESC, i.id DESC LIMIT 8
+      `).all();
+
+      const recentHistory = db.prepare(`
+        SELECT h.id, h.fecha, h.cliente_id,
+               c.nombre AS cliente_nombre, c.apellidos AS cliente_apellidos,
+               t.nombre AS tratamiento_nombre
+        FROM clinic_history h
+        JOIN clients c ON h.cliente_id = c.id
+        LEFT JOIN treatments t ON h.tratamiento_id = t.id
+        ORDER BY h.fecha DESC, h.id DESC LIMIT 8
+      `).all();
+
+      return {
+        success: true,
+        totalPatients,
+        monthRevenue,
+        pendingInvoices,
+        monthVisits,
+        recentInvoices,
+        recentHistory,
+      };
+    } catch (error) {
+      log.error('Dashboard summary error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // ─── CSV Import ───────────────────────────────────────────────────────────
+
+  ipcMain.handle('clients:importPreview', async () => {
+    try {
+      const { dialog } = require('electron');
+      const { previewCsv } = require('./csvImport');
+      const fs = require('fs');
+
+      const result = await dialog.showOpenDialog({
+        title: 'Seleccionar archivo CSV',
+        filters: [{ name: 'CSV', extensions: ['csv', 'txt'] }],
+        properties: ['openFile'],
+      });
+      if (result.canceled || !result.filePaths.length) return { success: false, canceled: true };
+
+      const filePath = result.filePaths[0];
+      const content  = fs.readFileSync(filePath, 'utf8');
+      const preview  = previewCsv(content);
+
+      return { success: true, filePath, ...preview };
+    } catch (error) {
+      log.error('CSV preview error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('clients:executeImport', async (event, { filePath, columnMap, skipDuplicates }) => {
+    try {
+      const { parseCsv } = require('./csvImport');
+      const { generateClientCode } = require('./database');
+      const fs = require('fs');
+      const db = getDb();
+
+      const content = fs.readFileSync(filePath, 'utf8');
+      const parsed  = parseCsv(content);
+      if (!parsed.length) return { success: false, error: 'Archivo vacío' };
+
+      const headers  = parsed[0];
+      const dataRows = parsed.slice(1);
+
+      // Build reverse map: fieldName → column index
+      const fieldIdx = {};
+      for (const [csvHeader, fieldName] of Object.entries(columnMap)) {
+        if (fieldName) fieldIdx[fieldName] = headers.indexOf(csvHeader);
+      }
+
+      const get = (row, field) => {
+        const idx = fieldIdx[field];
+        return (idx !== undefined && idx >= 0) ? (row[idx] || '').trim() : '';
+      };
+
+      const insertStmt = db.prepare(`
+        INSERT INTO clients
+          (codigo, nombre, apellidos, dni, telefono, email, direccion,
+           fecha_nacimiento, num_seguridad_social, observaciones, activo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+      `);
+
+      let imported = 0;
+      let skipped  = 0;
+      const errors = [];
+
+      const importAll = db.transaction(() => {
+        for (let i = 0; i < dataRows.length; i++) {
+          const row = dataRows[i];
+          const nombre = get(row, 'nombre');
+          if (!nombre) {
+            errors.push({ row: i + 2, reason: 'Nombre vacío' });
+            continue;
+          }
+
+          const dni = get(row, 'dni');
+          if (skipDuplicates && dni) {
+            const exists = db.prepare('SELECT id FROM clients WHERE dni = ?').get(dni);
+            if (exists) { skipped++; continue; }
+          }
+
+          const codigo = generateClientCode();
+          insertStmt.run(
+            codigo,
+            nombre,
+            get(row, 'apellidos'),
+            dni,
+            get(row, 'telefono'),
+            get(row, 'email'),
+            get(row, 'direccion'),
+            get(row, 'fecha_nacimiento') || null,
+            get(row, 'num_seguridad_social') || null,
+            get(row, 'observaciones') || null,
+          );
+          imported++;
+        }
+      });
+
+      importAll();
+
+      log.info(`CSV import: ${imported} imported, ${skipped} skipped, ${errors.length} errors`);
+      return { success: true, imported, skipped, errors };
+    } catch (error) {
+      log.error('CSV execute import error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   log.info('IPC handlers registered');
 }
 

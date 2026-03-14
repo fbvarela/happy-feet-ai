@@ -21,7 +21,9 @@ contextBridge.exposeInMainWorld('api', {
     update: (id, data) => ipcRenderer.invoke('clients:update', id, data),
     delete: (id) => ipcRenderer.invoke('clients:delete', id),
     getAuditLog: (id) => ipcRenderer.invoke('clients:getAuditLog', id),
-    exportCsv: (filters) => ipcRenderer.invoke('clients:exportCsv', filters),
+    exportCsv:      (filters)          => ipcRenderer.invoke('clients:exportCsv', filters),
+    importPreview:  ()                 => ipcRenderer.invoke('clients:importPreview'),
+    executeImport:  (opts)             => ipcRenderer.invoke('clients:executeImport', opts),
   },
   
   treatments: {
@@ -59,6 +61,19 @@ contextBridge.exposeInMainWorld('api', {
     search: (query) => ipcRenderer.invoke('clinicHistory:search', query),
   },
   
+  dashboard: {
+    getSummary: () => ipcRenderer.invoke('dashboard:getSummary'),
+  },
+
+  backup: {
+    getSettings:  ()         => ipcRenderer.invoke('backup:getSettings'),
+    saveSettings: (settings) => ipcRenderer.invoke('backup:saveSettings', settings),
+    runNow:       ()         => ipcRenderer.invoke('backup:runNow'),
+    getList:      ()         => ipcRenderer.invoke('backup:getList'),
+    chooseFolder: ()         => ipcRenderer.invoke('backup:chooseFolder'),
+    openFolder:   ()         => ipcRenderer.invoke('backup:openFolder'),
+  },
+
   accounting: {
     getReport: (startDate, endDate) => ipcRenderer.invoke('accounting:getReport', startDate, endDate),
     getVatReport: (year, quarter) => ipcRenderer.invoke('accounting:getVatReport', year, quarter),

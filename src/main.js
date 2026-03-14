@@ -1,9 +1,10 @@
 const { app, BrowserWindow, Menu } = require('electron');
 const path = require('node:path');
 const { log, setupGlobalErrorHandlers } = require('./main/logger');
-const { initDatabase, closeDatabase } = require('./main/database');
+const { initDatabase, closeDatabase, getDbPath } = require('./main/database');
 const { setupIpcHandlers } = require('./main/ipcHandlers');
 const { setMainWindow } = require('./main/sessionManager');
+const { scheduleBackup, stopBackupSchedule } = require('./main/backup');
 
 setupGlobalErrorHandlers();
 log.info('Happy Feet starting...');
@@ -86,8 +87,27 @@ function createMenu() {
 
 app.whenReady().then(() => {
   try {
-    initDatabase();
+    const db = initDatabase();
     setupIpcHandlers();
+
+    // Start automatic backup schedule if configured
+    const { getDb } = require('./main/database');
+    const dbInst = getDb();
+    const backupEnabled = dbInst.prepare("SELECT value FROM settings WHERE key = 'backup_enabled'").get();
+    if (backupEnabled && backupEnabled.value === '1') {
+      const folder    = dbInst.prepare("SELECT value FROM settings WHERE key = 'backup_folder'").get();
+      const interval  = dbInst.prepare("SELECT value FROM settings WHERE key = 'backup_interval_hours'").get();
+      const retention = dbInst.prepare("SELECT value FROM settings WHERE key = 'backup_retention'").get();
+      if (folder && folder.value) {
+        scheduleBackup(
+          getDbPath(),
+          parseInt(interval ? interval.value : '24'),
+          folder.value,
+          parseInt(retention ? retention.value : '10')
+        );
+      }
+    }
+
     createWindow();
 
     app.on('activate', () => {
@@ -109,5 +129,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  stopBackupSchedule();
   closeDatabase();
 });

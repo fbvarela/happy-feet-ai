@@ -332,6 +332,7 @@ function initApp() {
   setupSidebarToggle();
   setupSortableHeaders();
   setupKeyboardShortcuts();
+  setupBackupPage();
 }
 
 // ── Session timeout ────────────────────────────────────────────────────────
@@ -376,6 +377,7 @@ function setupLoginForm() {
       errorDiv.classList.add('hidden');
       showMainApp();
       await loadAllData();
+      loadDashboard();
       window.api.clinicHistory.migrateEncryption().then(r => {
         if (r.migrated > 0) {
           console.log(`Migrated ${r.migrated} plaintext records to encrypted storage`);
@@ -391,6 +393,12 @@ function setupLoginForm() {
 function showMainApp() {
   document.getElementById('login-page').classList.add('hidden');
   document.getElementById('main-app').classList.remove('hidden');
+  // Always start on dashboard
+  document.querySelectorAll('.nav-item:not(.logout)').forEach(n => n.classList.remove('active'));
+  document.querySelector('[data-page="dashboard"]')?.classList.add('active');
+  document.querySelectorAll('.page').forEach(p => { p.classList.remove('active'); p.classList.add('hidden'); });
+  document.getElementById('page-dashboard')?.classList.add('active');
+  document.getElementById('page-dashboard')?.classList.remove('hidden');
 }
 
 function showLoginPage() {
@@ -417,6 +425,9 @@ function setupNavigation() {
       });
       document.getElementById(`page-${page}`).classList.add('active');
       document.getElementById(`page-${page}`).classList.remove('hidden');
+
+      if (page === 'settings')  loadBackupSettings();
+      if (page === 'dashboard') loadDashboard();
     });
   });
 
@@ -2340,3 +2351,340 @@ const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
 
 document.getElementById('report-start-date').value = startOfMonth.toISOString().split('T')[0];
 document.getElementById('report-end-date').value = endOfMonth.toISOString().split('T')[0];
+
+// ── Backup page ────────────────────────────────────────────────────────────
+
+function setupBackupPage() {
+  document.getElementById('backup-choose-folder-btn')?.addEventListener('click', async () => {
+    const r = await window.api.backup.chooseFolder();
+    if (r.success) document.getElementById('backup-folder').value = r.folder;
+  });
+
+  document.getElementById('backup-save-btn')?.addEventListener('click', saveBackupSettings);
+
+  document.getElementById('backup-run-now-btn')?.addEventListener('click', async () => {
+    const r = await window.api.backup.runNow();
+    if (r.success) {
+      showToast('✓ Copia de seguridad creada correctamente', 'success');
+      renderBackupList();
+      updateLastRun();
+    } else {
+      showToast('Error: ' + r.error, 'error');
+    }
+  });
+
+  document.getElementById('backup-open-folder-btn')?.addEventListener('click', () => {
+    window.api.backup.openFolder();
+  });
+
+  document.getElementById('backup-refresh-list-btn')?.addEventListener('click', renderBackupList);
+}
+
+async function loadBackupSettings() {
+  const r = await window.api.backup.getSettings();
+  if (!r.success) return;
+  const s = r.settings;
+
+  document.getElementById('backup-enabled').checked = s.enabled;
+  document.getElementById('backup-folder').value = s.folder;
+
+  const intervalSel = document.getElementById('backup-interval');
+  if (intervalSel) intervalSel.value = String(s.intervalHours);
+
+  const retentionSel = document.getElementById('backup-retention');
+  if (retentionSel) retentionSel.value = String(s.retention);
+
+  updateLastRun(s.lastBackup);
+  renderBackupList();
+}
+
+async function saveBackupSettings() {
+  const enabled       = document.getElementById('backup-enabled').checked;
+  const folder        = document.getElementById('backup-folder').value.trim();
+  const intervalHours = parseInt(document.getElementById('backup-interval').value);
+  const retention     = parseInt(document.getElementById('backup-retention').value);
+
+  if (enabled && !folder) {
+    showToast('Seleccione una carpeta de destino', 'warning');
+    return;
+  }
+
+  const r = await window.api.backup.saveSettings({ enabled, folder, intervalHours, retention });
+  if (r.success) {
+    showToast('✓ Configuración guardada', 'success');
+  } else {
+    showToast('Error: ' + r.error, 'error');
+  }
+}
+
+async function renderBackupList() {
+  const r = await window.api.backup.getList();
+  const tbody = document.getElementById('backup-list-body');
+  const empty = document.getElementById('backup-list-empty');
+  if (!r.success || !r.list.length) {
+    if (tbody) tbody.innerHTML = '';
+    if (empty) empty.classList.remove('hidden');
+    return;
+  }
+  if (empty) empty.classList.add('hidden');
+  tbody.innerHTML = r.list.map(b => `
+    <tr>
+      <td style="font-family:monospace; font-size:12px;">${b.name}</td>
+      <td>${new Date(b.date).toLocaleString('es-ES')}</td>
+      <td>${formatBytes(b.size)}</td>
+    </tr>
+  `).join('');
+}
+
+function updateLastRun(iso) {
+  const el = document.getElementById('backup-last-run');
+  if (!el) return;
+  el.textContent = iso
+    ? `Última copia: ${new Date(iso).toLocaleString('es-ES')}`
+    : 'Ninguna copia realizada todavía';
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+// ── CSV Import ─────────────────────────────────────────────────────────────
+
+const IMPORT_FIELDS = [
+  { value: '',                     label: '— no importar —' },
+  { value: 'nombre',               label: 'Nombre' },
+  { value: 'apellidos',            label: 'Apellidos' },
+  { value: 'dni',                  label: 'DNI / NIF' },
+  { value: 'telefono',             label: 'Teléfono' },
+  { value: 'email',                label: 'Email' },
+  { value: 'direccion',            label: 'Dirección' },
+  { value: 'fecha_nacimiento',     label: 'Fecha de nacimiento' },
+  { value: 'num_seguridad_social', label: 'Nº Seguridad Social' },
+  { value: 'observaciones',        label: 'Observaciones' },
+];
+
+document.getElementById('import-csv-btn')?.addEventListener('click', startCsvImport);
+
+async function startCsvImport() {
+  showLoading();
+  const r = await window.api.clients.importPreview();
+  hideLoading();
+
+  if (r.canceled || !r.success) {
+    if (!r.canceled) showToast('Error al leer el archivo: ' + r.error, 'error');
+    return;
+  }
+
+  showImportPreviewModal(r);
+}
+
+function showImportPreviewModal({ filePath, headers, preview, totalRows, columnMap }) {
+  // ── Column mapping table ──────────────────────────────────────────────
+  const mappingRows = headers.map(h => {
+    const current = columnMap[h] || '';
+    const options = IMPORT_FIELDS.map(f =>
+      `<option value="${f.value}" ${current === f.value ? 'selected' : ''}>${f.label}</option>`
+    ).join('');
+    return `
+      <tr>
+        <td style="font-family:monospace; font-size:12px; padding:6px 10px;">${escapeHtml(h)}</td>
+        <td style="padding:6px 10px;">
+          <select class="form-control col-map-select" data-header="${escapeHtml(h)}" style="font-size:13px; padding:6px 10px;">
+            ${options}
+          </select>
+        </td>
+      </tr>`;
+  }).join('');
+
+  // ── Preview rows ──────────────────────────────────────────────────────
+  const previewHeader = headers.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+  const previewBody   = preview.map(row =>
+    `<tr>${headers.map(h => `<td style="font-size:12px;">${escapeHtml(row[h] || '')}</td>`).join('')}</tr>`
+  ).join('');
+
+  const body = `
+    <p style="color:var(--gray-600); font-size:13px; margin-bottom:16px;">
+      Archivo: <strong>${escapeHtml(filePath.split('/').pop().split('\\').pop())}</strong>
+      &nbsp;·&nbsp; <strong>${totalRows}</strong> filas detectadas
+    </p>
+
+    <h4 style="font-size:14px; font-weight:600; margin-bottom:8px; color:var(--gray-700);">Mapeo de columnas</h4>
+    <div style="overflow-x:auto; margin-bottom:20px;">
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead>
+          <tr>
+            <th style="text-align:left; padding:6px 10px; background:var(--gray-50); font-size:11px; text-transform:uppercase;">Columna CSV</th>
+            <th style="text-align:left; padding:6px 10px; background:var(--gray-50); font-size:11px; text-transform:uppercase;">Campo destino</th>
+          </tr>
+        </thead>
+        <tbody>${mappingRows}</tbody>
+      </table>
+    </div>
+
+    <h4 style="font-size:14px; font-weight:600; margin-bottom:8px; color:var(--gray-700);">
+      Vista previa (primeras ${preview.length} filas)
+    </h4>
+    <div style="overflow-x:auto; max-height:200px; overflow-y:auto; margin-bottom:20px;">
+      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead style="position:sticky; top:0; background:var(--gray-50);">
+          <tr>${previewHeader}</tr>
+        </thead>
+        <tbody>${previewBody}</tbody>
+      </table>
+    </div>
+
+    <div class="form-group" style="display:flex; align-items:center; gap:10px; margin-bottom:0;">
+      <label class="toggle-switch">
+        <input type="checkbox" id="import-skip-duplicates" checked>
+        <span class="toggle-slider"></span>
+      </label>
+      <span style="font-size:13px; color:var(--gray-700);">Omitir duplicados (mismo DNI)</span>
+    </div>
+  `;
+
+  const footer = `
+    <button class="btn btn-secondary" id="modal-cancel-import">Cancelar</button>
+    <button class="btn btn-primary" id="modal-confirm-import">Importar ${totalRows} registros</button>
+  `;
+
+  // Use a wider modal for the mapping table
+  const modalEl = document.querySelector('#modal-container .modal');
+  modalEl.classList.add('modal-large');
+  document.addEventListener('modal:closed', () => modalEl.classList.remove('modal-large'), { once: true });
+
+  openModal(`Importar pacientes desde CSV`, body, footer);
+
+  document.getElementById('modal-cancel-import').addEventListener('click', closeModal);
+
+  document.getElementById('modal-confirm-import').addEventListener('click', async () => {
+    // Read current column mapping from selects
+    const finalMap = {};
+    document.querySelectorAll('.col-map-select').forEach(sel => {
+      finalMap[sel.dataset.header] = sel.value;
+    });
+
+    // Validate: 'nombre' must be mapped
+    const hasNombre = Object.values(finalMap).includes('nombre');
+    if (!hasNombre) {
+      showToast('Debes mapear al menos la columna "Nombre"', 'warning');
+      return;
+    }
+
+    const skipDuplicates = document.getElementById('import-skip-duplicates').checked;
+
+    closeModal();
+    showLoading();
+    const result = await window.api.clients.executeImport({ filePath, columnMap: finalMap, skipDuplicates });
+    hideLoading();
+
+    if (result.success) {
+      await loadClients();
+      populateClientSelect();
+      showImportResultModal(result);
+    } else {
+      showToast('Error durante la importación: ' + result.error, 'error');
+    }
+  });
+}
+
+function showImportResultModal({ imported, skipped, errors }) {
+  const errorsHtml = errors.length
+    ? `<div style="margin-top:12px;">
+        <p style="font-weight:600; margin-bottom:6px; font-size:13px;">Filas con error (${errors.length}):</p>
+        <div style="max-height:160px; overflow-y:auto; background:var(--gray-50); border-radius:var(--radius); padding:10px; font-size:12px; font-family:monospace;">
+          ${errors.map(e => `Fila ${e.row}: ${escapeHtml(e.reason)}`).join('<br>')}
+        </div>
+      </div>`
+    : '';
+
+  const body = `
+    <div class="stats-grid" style="margin-bottom:0;">
+      <div class="stat-card">
+        <h4>Importados</h4>
+        <div class="value" style="color:var(--success-color);">${imported}</div>
+      </div>
+      <div class="stat-card">
+        <h4>Omitidos</h4>
+        <div class="value" style="color:var(--gray-500);">${skipped}</div>
+      </div>
+      <div class="stat-card">
+        <h4>Errores</h4>
+        <div class="value" style="color:${errors.length ? 'var(--danger-color)' : 'var(--gray-500)'};">${errors.length}</div>
+      </div>
+    </div>
+    ${errorsHtml}
+  `;
+
+  openModal('Resultado de la importación', body,
+    '<button class="btn btn-primary" id="import-result-close">Aceptar</button>');
+  document.getElementById('import-result-close').addEventListener('click', closeModal);
+}
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+
+function navigateTo(page) {
+  const navItem = document.querySelector(`[data-page="${page}"]`);
+  if (navItem) navItem.click();
+}
+
+async function loadDashboard() {
+  // Greeting + date
+  const greetEl  = document.getElementById('dashboard-greeting');
+  const dateEl   = document.getElementById('dashboard-date');
+  const hour     = new Date().getHours();
+  const greeting = hour < 13 ? 'Buenos días' : hour < 20 ? 'Buenas tardes' : 'Buenas noches';
+  if (greetEl) greetEl.textContent = currentUser ? `${greeting}, ${currentUser.username}` : greeting;
+  if (dateEl)  dateEl.textContent  = new Date().toLocaleDateString('es-ES', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+  // Wire quick-action buttons
+  document.getElementById('dash-new-patient-btn')?.addEventListener('click', () => { navigateTo('clients'); openClientModal(); }, { once: true });
+  document.getElementById('dash-new-invoice-btn')?.addEventListener('click', () => { navigateTo('accounting'); openInvoiceModal(); }, { once: true });
+  document.getElementById('dash-new-history-btn')?.addEventListener('click', () => { navigateTo('history'); }, { once: true });
+  document.getElementById('dash-goto-invoices')?.addEventListener('click',   () => navigateTo('accounting'), { once: true });
+  document.getElementById('dash-goto-history')?.addEventListener('click',    () => navigateTo('history'),    { once: true });
+
+  const r = await window.api.dashboard.getSummary();
+  if (!r.success) return;
+
+  // KPI cards
+  const fmt = v => new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(v);
+  document.getElementById('dash-total-patients').textContent    = r.totalPatients;
+  document.getElementById('dash-month-revenue').textContent     = fmt(r.monthRevenue);
+  document.getElementById('dash-pending-invoices').textContent  = r.pendingInvoices;
+  document.getElementById('dash-month-visits').textContent      = r.monthVisits;
+
+  // Recent invoices
+  const invBody  = document.getElementById('dash-recent-invoices-body');
+  const invEmpty = document.getElementById('dash-invoices-empty');
+  if (r.recentInvoices.length) {
+    invEmpty?.classList.add('hidden');
+    invBody.innerHTML = r.recentInvoices.map(i => `
+      <tr>
+        <td style="font-size:12px; font-family:monospace;">${escapeHtml(i.numero_factura)}</td>
+        <td style="font-size:13px;">${escapeHtml(i.cliente_nombre)} ${escapeHtml(i.cliente_apellidos || '')}</td>
+        <td style="font-size:13px;">${new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR'}).format(i.total)}</td>
+        <td>${estadoBadge(i.estado)}</td>
+      </tr>`).join('');
+  } else {
+    invEmpty?.classList.remove('hidden');
+    invBody.innerHTML = '';
+  }
+
+  // Recent history
+  const histBody  = document.getElementById('dash-recent-history-body');
+  const histEmpty = document.getElementById('dash-history-empty');
+  if (r.recentHistory.length) {
+    histEmpty?.classList.add('hidden');
+    histBody.innerHTML = r.recentHistory.map(h => `
+      <tr>
+        <td style="font-size:12px;">${new Date(h.fecha).toLocaleDateString('es-ES')}</td>
+        <td style="font-size:13px;">${escapeHtml(h.cliente_nombre)} ${escapeHtml(h.cliente_apellidos || '')}</td>
+        <td style="font-size:13px;">${escapeHtml(h.tratamiento_nombre || '—')}</td>
+      </tr>`).join('');
+  } else {
+    histEmpty?.classList.remove('hidden');
+    histBody.innerHTML = '';
+  }
+}
