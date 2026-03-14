@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node:*)",
+      "Read(//Users/fernando/Documents/git-projects/ai/happy-feet/**)",
+      "Bash(sed:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}
